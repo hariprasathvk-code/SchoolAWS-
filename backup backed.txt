@@ -1,0 +1,467 @@
+copyof the workin code:
+
+RegisterUser:
+
+import json
+import boto3
+import hmac
+import hashlib
+import base64
+from datetime import datetime
+
+dynamodb = boto3.resource('dynamodb')
+cognito = boto3.client('cognito-idp')
+table = dynamodb.Table('UsersDB')
+
+USER_POOL_ID = 'us-east-2_vpTJU46i3'
+CLIENT_ID = '3u6ro89efpjjok2q7hd5pm91i4'
+CLIENT_SECRET = '15adba8c7bjj0uav3adea944rtahkg0koh6ga85l9et1l514q1d3'
+
+def get_secret_hash(username):
+    """Calculate SECRET_HASH for Cognito confidential client"""
+    message = username + CLIENT_ID
+    dig = hmac.new(
+        CLIENT_SECRET.encode('UTF-8'),
+        msg=message.encode('UTF-8'),
+        digestmod=hashlib.sha256
+    ).digest()
+    return base64.b64encode(dig).decode()
+
+def lambda_handler(event, context):
+    # CORS headers - ADD THIS
+    cors_headers = {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST,OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+    }
+    
+    # Handle OPTIONS request - ADD THIS
+    if event.get('httpMethod') == 'OPTIONS':
+        return {
+            'statusCode': 200,
+            'headers': cors_headers,
+            'body': json.dumps({'message': 'OK'})
+        }
+    
+    try:
+        body = json.loads(event['body'])
+        email = body['email']
+        password = body['password']
+        name = body['name']
+        role = body['role'].lower()
+        birthdate = body.get('birthdate', '2000-01-01')
+        
+        secret_hash = get_secret_hash(email)
+        
+        # Create user in Cognito
+        response = cognito.sign_up(
+            ClientId=CLIENT_ID,
+            SecretHash=secret_hash,
+            Username=email,
+            Password=password,
+            UserAttributes=[
+                {'Name': 'email', 'Value': email},
+                {'Name': 'name', 'Value': name},
+                {'Name': 'birthdate', 'Value': birthdate}
+            ]
+        )
+        
+        user_id = response['UserSub']
+        
+        # Auto-confirm user
+        cognito.admin_confirm_sign_up(
+            UserPoolId=USER_POOL_ID,
+            Username=email
+        )
+        
+        # Add user to appropriate group
+        group_name = 'Teachers' if role == 'teacher' else 'Students'
+        cognito.admin_add_user_to_group(
+            UserPoolId=USER_POOL_ID,
+            Username=email,
+            GroupName=group_name
+        )
+        
+        # Store in DynamoDB
+        table.put_item(
+            Item={
+                'UserID': user_id,
+                'email': email,
+                'name': name,
+                'role': role,
+                'birthdate': birthdate,
+                'createdAt': datetime.now().isoformat()
+            }
+        )
+        
+        return {
+            'statusCode': 200,
+            'headers': cors_headers,  # CHANGED THIS
+            'body': json.dumps({
+                'message': 'User registered successfully',
+                'userId': user_id,
+                'email': email,
+                'role': role
+            })
+        }
+    
+    except cognito.exceptions.UsernameExistsException:
+        return {
+            'statusCode': 400,
+            'headers': cors_headers,  # CHANGED THIS
+            'body': json.dumps({'error': 'User with this email already exists'})
+        }
+    
+    except cognito.exceptions.InvalidPasswordException as e:
+        return {
+            'statusCode': 400,
+            'headers': cors_headers,  # CHANGED THIS
+            'body': json.dumps({'error': f'Invalid password: {str(e)}'})
+        }
+    
+    except cognito.exceptions.InvalidParameterException as e:
+        return {
+            'statusCode': 400,
+            'headers': cors_headers,  # CHANGED THIS
+            'body': json.dumps({'error': f'Invalid parameter: {str(e)}'})
+        }
+    
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'headers': cors_headers,  # CHANGED THIS
+            'body': json.dumps({'error': f'Internal error: {str(e)}'})
+        }
+
+
+
+
+LoginUser:
+
+import json
+import boto3
+import hmac
+import hashlib
+import base64
+
+cognito = boto3.client('cognito-idp')
+
+USER_POOL_ID = 'us-east-2_vpTJU46i3'
+CLIENT_ID = '3u6ro89efpjjok2q7hd5pm91i4'
+CLIENT_SECRET = '15adba8c7bjj0uav3adea944rtahkg0koh6ga85l9et1l514q1d3'
+
+def get_secret_hash(username):
+    """Calculate SECRET_HASH for Cognito confidential client"""
+    message = username + CLIENT_ID
+    dig = hmac.new(
+        CLIENT_SECRET.encode('UTF-8'),
+        msg=message.encode('UTF-8'),
+        digestmod=hashlib.sha256
+    ).digest()
+    return base64.b64encode(dig).decode()
+
+def lambda_handler(event, context):
+    # Print event for debugging
+    print(f"EVENT: {json.dumps(event)}")
+    
+    # CORS headers
+    cors_headers = {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST,OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+    }
+    
+    # Handle OPTIONS request for CORS preflight
+    if event.get('httpMethod') == 'OPTIONS':
+        return {
+            'statusCode': 200,
+            'headers': cors_headers,
+            'body': json.dumps({'message': 'OK'})
+        }
+    
+    try:
+        # Safely get body
+        body = json.loads(event.get('body', '{}'))
+        email = body.get('email')
+        password = body.get('password')
+        
+        if not email or not password:
+            return {
+                'statusCode': 400,
+                'headers': cors_headers,
+                'body': json.dumps({'error': 'Email and password are required'})
+            }
+        
+        print(f"Attempting login for: {email}")
+        
+        secret_hash = get_secret_hash(email)
+        
+        # Authenticate user with Cognito
+        response = cognito.initiate_auth(
+            ClientId=CLIENT_ID,
+            AuthFlow='USER_PASSWORD_AUTH',
+            AuthParameters={
+                'USERNAME': email,
+                'PASSWORD': password,
+                'SECRET_HASH': secret_hash
+            }
+        )
+        
+        print("Login successful!")
+        
+        # Extract JWT tokens from Cognito response
+        id_token = response['AuthenticationResult']['IdToken']
+        access_token = response['AuthenticationResult']['AccessToken']
+        refresh_token = response['AuthenticationResult']['RefreshToken']
+        
+        return {
+            'statusCode': 200,
+            'headers': cors_headers,
+            'body': json.dumps({
+                'message': 'Login successful',
+                'idToken': id_token,
+                'accessToken': access_token,
+                'refreshToken': refresh_token,
+                'email': email
+            })
+        }
+        
+    except cognito.exceptions.NotAuthorizedException as e:
+        print(f"NotAuthorizedException: {str(e)}")
+        return {
+            'statusCode': 401,
+            'headers': cors_headers,
+            'body': json.dumps({'error': 'Incorrect username or password'})
+        }
+    
+    except cognito.exceptions.UserNotFoundException as e:
+        print(f"UserNotFoundException: {str(e)}")
+        return {
+            'statusCode': 404,
+            'headers': cors_headers,
+            'body': json.dumps({'error': 'User does not exist'})
+        }
+    
+    except cognito.exceptions.UserNotConfirmedException as e:
+        print(f"UserNotConfirmedException: {str(e)}")
+        return {
+            'statusCode': 400,
+            'headers': cors_headers,
+            'body': json.dumps({
+                'error': 'User is not confirmed. Please check your email for confirmation code.',
+                'email': email
+            })
+        }
+    
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        
+        return {
+            'statusCode': 500,
+            'headers': cors_headers,
+            'body': json.dumps({'error': f'Login failed: {str(e)}'})
+        }
+
+
+
+
+UserCrud:
+
+import json
+import boto3
+import uuid
+from datetime import datetime
+
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('UsersDB')
+
+def lambda_handler(event, context):
+    # Print event for debugging
+    print(f"EVENT: {json.dumps(event)}")
+    
+    # Safely get httpMethod
+    http_method = event.get('httpMethod', event.get('requestContext', {}).get('http', {}).get('method', ''))
+    path = event.get('path', event.get('rawPath', ''))
+    
+    # CORS headers
+    cors_headers = {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+    }
+    
+    try:
+        # Handle OPTIONS for CORS preflight
+        if http_method == 'OPTIONS':
+            return {
+                'statusCode': 200,
+                'headers': cors_headers,
+                'body': json.dumps({'message': 'OK'})
+            }
+        
+        # Get user groups from Cognito authorizer claims
+        user_groups = []
+        try:
+            request_context = event.get('requestContext', {})
+            authorizer = request_context.get('authorizer', {})
+            claims = authorizer.get('claims', {})
+            
+            user_groups_str = claims.get('cognito:groups', '')
+            user_groups = user_groups_str.split(',') if user_groups_str else []
+            
+            print(f"User groups: {user_groups}")
+        except Exception as e:
+            print(f"Could not extract user groups: {str(e)}")
+        
+        # GET /users - View all users (both students and teachers)
+        if http_method == 'GET' and path == '/users':
+            print("Handling GET /users")
+            response = table.scan()
+            return {
+                'statusCode': 200,
+                'headers': cors_headers,
+                'body': json.dumps(response.get('Items', []))
+            }
+        
+        # POST /users - Create user (teachers only)
+        elif http_method == 'POST' and path == '/users':
+            print("Handling POST /users")
+            
+            if 'Teachers' not in user_groups:
+                return {
+                    'statusCode': 403,
+                    'headers': cors_headers,
+                    'body': json.dumps({'error': 'Unauthorized. Only teachers can create users.'})
+                }
+            
+            body = json.loads(event.get('body', '{}'))
+            
+            # AUTO-GENERATE UserID using UUID
+            generated_user_id = str(uuid.uuid4())
+            
+            # Create the item with auto-generated UserID
+            item = {
+                'UserID': generated_user_id,  # Auto-generated!
+                'email': body.get('email'),
+                'name': body.get('name'),
+                'role': body.get('role'),
+                'birthdate': body.get('birthdate'),
+                'createdAt': datetime.now().isoformat()
+            }
+            
+            # Add any additional fields from the request body
+            for key, value in body.items():
+                if key not in ['UserID', 'email', 'name', 'role', 'birthdate', 'createdAt']:
+                    item[key] = value
+            
+            table.put_item(Item=item)
+            
+            return {
+                'statusCode': 201,
+                'headers': cors_headers,
+                'body': json.dumps({
+                    'message': 'User created successfully',
+                    'UserID': generated_user_id,  # Return the generated ID
+                    'email': body.get('email')
+                })
+            }
+        
+        # PUT /users/{id} - Update user (teachers only)
+        elif http_method == 'PUT' and '/users/' in path:
+            print("Handling PUT /users/{id}")
+            
+            if 'Teachers' not in user_groups:
+                return {
+                    'statusCode': 403,
+                    'headers': cors_headers,
+                    'body': json.dumps({'error': 'Unauthorized. Only teachers can update users.'})
+                }
+            
+            user_id = path.split('/')[-1]
+            body = json.loads(event.get('body', '{}'))
+            
+            # Build update expression with reserved keyword handling
+            update_expr = "SET "
+            expr_values = {}
+            expr_names = {}
+            
+            for key, value in body.items():
+                # Skip UserID - cannot update partition key
+                if key == 'UserID':
+                    continue
+                    
+                # Handle DynamoDB reserved keywords
+                if key in ['name', 'role', 'status', 'data', 'date']:
+                    expr_names[f'#{key}'] = key
+                    update_expr += f"#{key} = :{key}, "
+                else:
+                    update_expr += f"{key} = :{key}, "
+                expr_values[f":{key}"] = value
+            
+            update_expr = update_expr.rstrip(', ')
+            
+            # Build update parameters
+            update_params = {
+                'Key': {'UserID': user_id},
+                'UpdateExpression': update_expr,
+                'ExpressionAttributeValues': expr_values
+            }
+            
+            if expr_names:
+                update_params['ExpressionAttributeNames'] = expr_names
+            
+            table.update_item(**update_params)
+            
+            return {
+                'statusCode': 200,
+                'headers': cors_headers,
+                'body': json.dumps({'message': 'User updated successfully'})
+            }
+        
+        # DELETE /users/{id} - Delete user (teachers only)
+        elif http_method == 'DELETE' and '/users/' in path:
+            print("Handling DELETE /users/{id}")
+            
+            if 'Teachers' not in user_groups:
+                return {
+                    'statusCode': 403,
+                    'headers': cors_headers,
+                    'body': json.dumps({'error': 'Unauthorized. Only teachers can delete users.'})
+                }
+            
+            user_id = path.split('/')[-1]
+            table.delete_item(Key={'UserID': user_id})
+            
+            return {
+                'statusCode': 200,
+                'headers': cors_headers,
+                'body': json.dumps({'message': 'User deleted successfully'})
+            }
+        
+        # Method not allowed
+        else:
+            return {
+                'statusCode': 405,
+                'headers': cors_headers,
+                'body': json.dumps({
+                    'error': 'Method not allowed',
+                    'receivedMethod': http_method,
+                    'receivedPath': path
+                })
+            }
+        
+    except Exception as e:
+        print(f"ERROR: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        
+        return {
+            'statusCode': 500,
+            'headers': cors_headers,
+            'body': json.dumps({'error': f'Internal server error: {str(e)}'})
+        }
